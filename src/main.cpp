@@ -36,13 +36,13 @@ volatile sig_atomic_t g_stopRequested = 0;
 // 对于 stdio 传输，SIGINT 会中断阻塞的 read() 系统调用使 Connect 循环退出。
 // 对于 HTTP/SSE 传输，Connect 循环会在下次迭代检测到 isStopping_ 后退出。
 
-// ?[全局变量] notificationState：
+// ?[全局变量] 定义全局结构体变量-notificationState：
 // todo:一个全局结构体实例，包含一个互斥锁，用于保护服务器发送通知时的线程安全。
 struct NotificationState
 {
   std::mutex serverNotificationMutex;
 };
-NotificationState notificationState;
+NotificationState notificationState; // 后续会在“插件回调”中使用这个互斥锁，确保在多线程环境下向服务器发送通知时不会发生竞态条件。
 
 // ?[函数] stop_handler-信号处理函数
 // todo:用于替换默认的 SIGINT 处理行为，使得在接收到 Ctrl+C 时能够优雅地关闭服务器，而不是直接终止进程。
@@ -58,7 +58,10 @@ void stop_handler(sig_atomic_t s)
   }
 }
 
-// Notification Implementation from plugins to mcp-client
+// ?[函数] ClientNotificationCallbackImpl-插件通知回调实现
+// todo:这是一个全局函数，作为插件发送通知到 MCP 客户端的回调实现。
+// 当插件 plugin 需要向 MCP-client发送通知时，会调用这个函数。
+// 内部用到了上面定义的notificationState.serverNotificationMutex互斥锁，确保在多线程环境下向服务器发送通知时的线程安全。
 void ClientNotificationCallbackImpl(const char *pluginName,
                                     const char *notification)
 {
@@ -76,9 +79,12 @@ void ClientNotificationCallbackImpl(const char *pluginName,
 // 2. 插件加载和 MCP 请求处理器注册放在一起，形成清晰的“能力挂接”逻辑。
 // 3. 主消息循环在 Server 内部实现，main 函数只负责启动和优雅关闭，保持简洁。
 
-// !【主函数】
 int main(int argc, char **argv)
 {
+  // !==============================================================================
+  // !【阶段一】前期准备：声明配置变量、核心对象初始化、信号处理函数注册、命令行参数解析、日志系统初始化
+  // !==============================================================================
+
   //============================================================================================
   // 定义各种配置变量和核心对象
   // todo:[变量定义和处理逻辑de"解耦"]
@@ -91,12 +97,12 @@ int main(int argc, char **argv)
   std::string logs_directory;    // 日志目录，默认 "./logs"
   bool verbose;                  // 是否启用详细日志（bool类型），默认false，可以通过命令行参数“--verbose”启用
 
-  // ?[传输层初始化]
+  // ?[初始化：传输层基类指针]
   // transport-传输层接口指针：后续会根据命令行参数选择具体的传输实现
   // （SSE、HTTP Stream 或 Stdio）
   std::shared_ptr<vx::ITransport> transport;
 
-  // !【两大核心对象】（以智能指针形式实例化）
+  // ?[初始化：两大核心对象]————PluginsLoader/Server（以智能指针形式实例化）
   // 1.loader-PluginsLoader类：插件加载器，后续会用它来加载插件并监控插件目录的变化，实现热更新功能。
   // 2.server-Server类：MCP协议服务器————最核心的组件，负责处理来自客户端的请求，并通过注册的回调函数把请求分发给插件处理。
   loader = std::make_shared<vx::mcp::PluginsLoader>();
@@ -225,24 +231,33 @@ int main(int argc, char **argv)
             << std::endl;
   LOG(INFO) << "Press Ctrl+C to exit." << std::endl;
 
+  // !==============================================================================
+  // !【阶段二】插件加载和能力挂接：设置回调、加载插件、注册 MCP 请求处理器————最终启动服务器循环
+  // !==============================================================================
   //============================================================================================
-  // 加载插件并建立插件 <-> MCP 服务端之间的桥接关系
-  // main 的核心职责之一，就是把“插件能力”挂接到统一的 MCP 协议入口上。
+  // todo：插件loader-设置回调、加载插件
+  // 1.注册插件回调：告诉插件管理器，以后插件发生某些事件时该做出什么反应（怎么通知外界）
+  // 2.正式加载插件：注册好各种回调后，从指定目录加载插件，并输出加载结果日志。
   //============================================================================================
-  // 在加载插件前设置回调，新插件加载成功后自动挂载通知系统
-  loader->SetOnPluginLoaded([](vx::mcp::PluginEntry &plugin)
-                            {
-    // 每个插件都注入一个通知系统，这样插件内部就能主动向 MCP 客户端推送通知。
-    plugin.instance->notifications = new NotificationSystem();
-    plugin.instance->notifications->SendToClient =
-        ClientNotificationCallbackImpl; });
 
+  // ?[注册回调]-SetOnPluginLoaded 插件加载成功回调
+  // 在加载插件前设置回调，新插件加载成功后都会调用这个回调函数
+  // 在回调函数中，我们为每个插件实例注入一个通知系统，使得插件能够主动向 MCP 客户端发送通知。
+  loader->SetOnPluginLoaded(
+      [](vx::mcp::PluginEntry &plugin)
+      {
+        plugin.instance->notifications = new NotificationSystem(); //
+        plugin.instance->notifications->SendToClient = ClientNotificationCallbackImpl;
+      });
+
+  // ?[注册回调]-SetOnPluginsChanged 插件列表变化回调
   // 插件列表变化后按类型通知客户端重新拉取
+  // todo:这里发送的是“列表已变化”的“通知”，而不是直接把完整列表推送给客户端。
+  // todo:（MCP官方文档）客户端收到通知后，要主动发个“请求”来“响应”该通知
+  // 也就是说，客户端要主动发起请求（调用method）：tools/list、prompts/list、resources/list 等来进行询问
   loader->SetOnPluginsChanged(
       [](bool toolsChanged, bool promptsChanged, bool resourcesChanged)
       {
-        // 这里发送的是“列表已变化”的通知，而不是直接把完整列表推送给客户端。
-        // 客户端收到通知后，会再次调用 tools/list、prompts/list、resources/list
         // 拉取最新快照。
         if (server && server->IsValid())
         {
@@ -267,23 +282,31 @@ int main(int argc, char **argv)
         }
       });
 
+  // ?[正式加载插件]-LoadPlugins
+  // 注册完回调后，立即加载插件目录下的插件，并输出加载结果日志。
   if (loader->LoadPlugins(plugins_directory))
   {
     LOG(INFO) << "Successfully loaded plugins" << std::endl;
   }
 
-  // 启动后台监听线程，每 5 秒扫描一次插件目录变化（新增、更新、删除）。
+  // ?[启动插件监听]-StartWatching
+  // todo:插件“热更新机制”的核心————在后台启动一个线程，定期扫描插件目录的变化（新增、更新、删除），并根据变化动态加载/卸载插件。
+  // !【插件“热更新”机制】：启动后台监听线程，每 5 秒扫描一次插件目录变化（新增、更新、删除）。
   // 这样服务启动后仍然支持插件热更新，而不需要重启整个进程。
   loader->StartWatching(plugins_directory, std::chrono::seconds(5));
 
   //============================================================================================
-  // 配置 Server 并覆盖默认 MCP 回调
+  // todo: 服务器Server-设置回调、注册 MCP-client 请求处理器
   // Server 内部本来有一套默认实现，在这里用插件驱动的实现覆盖掉，
   // 让 tools/prompts/resources 三类请求真正落到已加载插件上。
   //============================================================================================
   server->Name(name);
   server->VerboseLevel(verbose ? 1 : 0);
 
+  // ?[注册 MCP 请求处理器]-OverrideCallback
+  // todo:这部分的逻辑就像是nginx中的 “location配置”/路由，告诉服务器：当收到某个特定method的请求时，调用这个函数来处理。
+  // todo:跟cgi协议很像
+  // 1. tools/list 请求处理器：返回当前所有工具插件的列表和
   server->OverrideCallback("tools/list", [](const json &request)
                            {
     nlohmann::ordered_json response = MCPBuilder::Response(request);
@@ -307,6 +330,7 @@ int main(int argc, char **argv)
 
     return response; });
 
+  // 2. tools/call 请求处理器：根据工具名找到对应插件，并把原始请求转交给插件处理，最后把插件的响应再包装成 MCP 标准响应返回给客户端。
   server->OverrideCallback("tools/call", [](const json &request)
                            {
     nlohmann::ordered_json response = MCPBuilder::Response(request);
@@ -346,6 +370,7 @@ int main(int argc, char **argv)
     }
     return response; });
 
+  // 3. prompts/list 请求处理器：返回当前所有 Prompt 插件暴露的 prompt 元数据列表，供客户端浏览和选择。
   server->OverrideCallback("prompts/list", [](const json &request)
                            {
     nlohmann::ordered_json response = MCPBuilder::Response(request);
@@ -368,6 +393,7 @@ int main(int argc, char **argv)
 
     return response; });
 
+  // 4. prompts/get 请求处理器：根据 prompt 名称定位插件，并把完整请求交给插件生成 prompt 内容。
   server->OverrideCallback("prompts/get", [](const json &request)
                            {
     nlohmann::ordered_json response = MCPBuilder::Response(request);
@@ -397,6 +423,7 @@ int main(int argc, char **argv)
     }
     return response; });
 
+  // 5. resources/list 请求处理器：返回当前所有资源插件暴露的资源清单，供客户端浏览和选择。
   server->OverrideCallback("resources/list", [](const json &request)
                            {
     nlohmann::ordered_json response = MCPBuilder::Response(request);
@@ -420,6 +447,7 @@ int main(int argc, char **argv)
     
     return response; });
 
+  // 6. resources/read 请求处理器：根据资源 URI 找到具体资源提供者，再让插件返回实际资源内容。
   server->OverrideCallback("resources/read", [](const json &request)
                            {
     nlohmann::ordered_json response = MCPBuilder::Response(request);
@@ -449,15 +477,15 @@ int main(int argc, char **argv)
 
     return response; });
 
-  // todo【进入主消息循环】
+  // ?[进入服务器主循环]-Connect
+  // todo：在循环内部，Server会持续执行：“解析请求 -> 解析 JSON -> 按 method 分发 -> 写回响应”。
+  server->Connect(transport);
   // 这是一个阻塞调用，直到以下任一情况发生才会返回：
   // 1. 客户端断开连接
   // 2. 收到 Ctrl+C，请求停止
   // 3. 传输层或解析过程出现不可继续的错误
-  // 在循环内部，Server 会持续执行“读请求 -> 解析 JSON -> 按 method 分发 ->
-  // 写回响应”。
-  server->Connect(transport);
 
+  // ?[资源清理和优雅退出]
   // Connect 返回后，说明主服务循环已经结束（正常退出或停止中）。
   // 下面统一执行收尾逻辑，确保后台监控线程、插件对象、传输层都被有序释放。
   if (g_stopRequested)
